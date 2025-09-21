@@ -1,6 +1,7 @@
 python-dotenv>=1.0.1
 streamlit>=1.37.0
 openai>=1.40.0
+groq>0.4.2
 PyYAML>=6.0.2
 # NEW for RAG:
 pypdf>=4.3.1
