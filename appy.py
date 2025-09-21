@@ -381,33 +381,52 @@ def demo_build_store(uploaded_files):
         st.session_state.rag_index = faiss.IndexFlatIP(dim)
 
     for file in uploaded_files:
-        name = file.name
-        ext = name.lower().rsplit(".", 1)[-1]
-        if ext not in ("pdf", "txt"):
+        try:
+            name = file.name
+            ext = name.lower().rsplit(".", 1)[-1]
+            if ext not in ("pdf", "txt"):
+                st.warning(f"Skipping unsupported file: {name}")
+                continue
+
+            # Extract
+            if ext == "pdf":
+                try:
+                    pages = extract_text_from_pdf_filelike(file)
+                except Exception as e:
+                    st.error(f"Failed to read PDF {name}: {e}")
+                    continue
+            else:
+                try:
+                    txt = file.read().decode("utf-8", errors="ignore")
+                except Exception as e:
+                    st.error(f"Failed to read TXT {name}: {e}")
+                    continue
+                pages = [(txt, 1)]
+
+            if not pages:
+                st.warning(f"No text found in {name}. Skipping.")
+                continue
+
+            # Chunk, embed, add
+            chunks_all = []
+            for page_text, page_num in pages:
+                for ch in chunk_text(page_text):
+                    chunks_all.append({"text": ch, "page": page_num})
+            if not chunks_all:
+                st.warning(f"No chunks produced for {name}. Skipping.")
+                continue
+
+            vecs = embedder.encode([c["text"] for c in chunks_all], batch_size=64, normalize_embeddings=True)
+            st.session_state.rag_index.add(np.array(vecs, dtype="float32"))
+
+            st.session_state.rag_meta["docs"].append({"source": name, "chunks": chunks_all})
+            added.append({"file": name, "chunks": len(chunks_all)})
+        except Exception as e:
+            st.error(f"Error processing {file.name}: {e}")
             continue
-
-        # Extract
-        if ext == "pdf":
-            pages = extract_text_from_pdf_filelike(file)
-        else:
-            txt = file.read().decode("utf-8", errors="ignore")
-            pages = [(txt, 1)]
-
-        # Chunk, embed, add
-        chunks_all = []
-        for page_text, page_num in pages:
-            for ch in chunk_text(page_text):
-                chunks_all.append({"text": ch, "page": page_num})
-        if not chunks_all:
-            continue
-
-        vecs = embedder.encode([c["text"] for c in chunks_all], batch_size=64, normalize_embeddings=True)
-        st.session_state.rag_index.add(np.array(vecs, dtype="float32"))
-
-        st.session_state.rag_meta["docs"].append({"source": name, "chunks": chunks_all})
-        added.append({"file": name, "chunks": len(chunks_all)})
 
     return {"added": added, "total_docs": len(st.session_state.rag_meta["docs"])}
+
 
 def demo_retrieve_context(query: str, k: int = 5):
     _ensure_demo_rag()
