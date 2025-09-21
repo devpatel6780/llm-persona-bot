@@ -3,7 +3,8 @@
 A **Streamlit-based chatbot** powered by **Groq's ultra-fast LLaMA 3.3 model** and a flexible **persona system**.  
 Includes **Retrieval-Augmented Generation (RAG)** so users can upload PDFs/TXT files and ask questions with cited answers — all processed locally or in the cloud.
 
-![Demo Screenshot](https://user-images.githubusercontent.com/your-demo-image.png) <!-- optional: replace with screenshot -->
+![Demo Screenshot]<img width="1910" height="868" alt="image" src="https://github.com/user-attachments/assets/9fc64461-7778-4883-86b7-0c23dc2778ef" />
+
 
 ---
 
