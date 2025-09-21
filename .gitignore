@@ -1,0 +1,14 @@
+# secrets
+.env
+.streamlit/secrets.toml
+
+# local data
+chats/
+stores/
+profile.json
+
+# caches & junk
+__pycache__/
+*.pyc
+*.DS_Store
+.cache/

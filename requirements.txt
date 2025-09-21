@@ -1,0 +1,9 @@
+python-dotenv>=1.0.1
+streamlit>=1.37.0
+openai>=1.40.0
+PyYAML>=6.0.2
+# NEW for RAG:
+pypdf>=4.3.1
+sentence-transformers>=2.7.0
+faiss-cpu>=1.8.0
+numpy>=1.26.4
