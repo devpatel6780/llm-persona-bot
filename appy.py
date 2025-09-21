@@ -1,35 +1,69 @@
+# appy.py — LLM Persona Chatbot (Streamlit + Groq + optional RAG)
+# -----------------------------------------------------------------
+# - DEMO_MODE="1" in Secrets/Env -> per-session memory (no disk writes)
+# - Robust PDF handling and FAISS index management
+# - Timezone-aware timestamps (no deprecation warnings)
+
 import os
 os.environ["TRANSFORMERS_NO_TF"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-# Demo mode toggle (set DEMO_MODE="1" in Streamlit Secrets for public demo)
-DEMO_MODE = os.getenv("DEMO_MODE", "0") == "1"
-# ─────────────────────────────────────────────────────────────────────────────
 
 import json
 import yaml
 import uuid
 import shutil
-import numpy as np
-from datetime import datetime
+import warnings
+from io import BytesIO
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
+import numpy as np
 import streamlit as st
 from dotenv import load_dotenv
 from groq import Groq
 
-# RAG deps
+# Optional FAISS import (RAG disabled if not available)
+try:
+    import faiss  # type: ignore
+    FAISS_OK = True
+except Exception:
+    FAISS_OK = False
+
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
-import faiss
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MUST be the first Streamlit call
 st.set_page_config(page_title="🤖 Groq Persona Chatbot", page_icon="🤖", layout="wide")
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ========= Constants & paths =========
+# ====== Config / Secrets ======
+load_dotenv()
+
+def get_secret_or_env(key: str, default: Optional[str] = None) -> Optional[str]:
+    """Safely read a value from Streamlit secrets; if secrets file is missing
+    or key not found, fall back to environment variables."""
+    try:
+        # st.secrets behaves like a Mapping, but accessing missing keys (or having no file)
+        # raises StreamlitSecretNotFoundError. So we catch broadly here.
+        val = st.secrets[key]  # type: ignore[index]
+    except Exception:
+        val = os.getenv(key, default)
+    return val
+
+DEMO_MODE = str(get_secret_or_env("DEMO_MODE", "0")).strip().strip('"') == "1"
+API_KEY = get_secret_or_env("GROQ_API_KEY")
+
+if not API_KEY:
+    st.error("❌ Missing GROQ_API_KEY. Set it in .env (GROQ_API_KEY=...) or in .streamlit/secrets.toml.")
+    st.stop()
+
+client = Groq(api_key=str(API_KEY).strip())
+
+# ====== Constants & paths ======
 BASE_DIR = Path(".")
 CHATS_DIR = BASE_DIR / "chats"
 STORES_DIR = BASE_DIR / "stores"          # per-chat vector stores
@@ -45,23 +79,15 @@ MODEL_CHOICES = [
     "llama-3.1-8b-instant",
 ]
 
-EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # 384-dim
+EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # dim auto-detected
 
-# ========= Env & client =========
-load_dotenv()
-API_KEY = os.getenv("GROQ_API_KEY")
-if not API_KEY:
-    st.error("❌ Missing GROQ_API_KEY (.env locally or Secrets in Streamlit Cloud).")
-    st.stop()
-client = Groq(api_key=API_KEY.strip())
-
-# ========= Persona loading =========
+# ====== Personas ======
 @st.cache_data
-def load_personas(path="personas.yaml"):
+def load_personas(path: str = "personas.yaml") -> Dict[str, dict]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             y = yaml.safe_load(f) or {}
-            return y.get("personas", {})
+            return y.get("personas", {}) or {}
     except Exception:
         return {
             "career_coach": {
@@ -80,7 +106,7 @@ def load_personas(path="personas.yaml"):
 
 PERSONAS = load_personas()
 
-# ========= User Profile =========
+# ====== Profile ======
 DEFAULT_PROFILE = {
     "name": "",
     "role_or_studies": "",
@@ -91,11 +117,9 @@ DEFAULT_PROFILE = {
 
 def load_profile() -> dict:
     if DEMO_MODE:
-        # keep profile in session only (no disk)
         if "PROFILE" not in st.session_state:
             st.session_state.PROFILE = DEFAULT_PROFILE.copy()
         return st.session_state.PROFILE
-
     if PROFILE_PATH.exists():
         try:
             with open(PROFILE_PATH, "r", encoding="utf-8") as f:
@@ -107,6 +131,7 @@ def load_profile() -> dict:
             return DEFAULT_PROFILE.copy()
     return DEFAULT_PROFILE.copy()
 
+
 def save_profile(p: dict):
     clean = DEFAULT_PROFILE.copy()
     clean.update({k: (p.get(k) or "").strip() for k in DEFAULT_PROFILE})
@@ -116,7 +141,9 @@ def save_profile(p: dict):
     with open(PROFILE_PATH, "w", encoding="utf-8") as f:
         json.dump(clean, f, ensure_ascii=False, indent=2)
 
+
 PROFILE = load_profile()
+
 
 def profile_summary_text(p: dict) -> str:
     bits = []
@@ -127,8 +154,10 @@ def profile_summary_text(p: dict) -> str:
     if p.get("tone_preferences"): bits.append(f'Tone preferences: {p["tone_preferences"]}.')
     return " ".join(bits) if bits else "No additional user profile context provided."
 
-# ========= System prompt =========
-def build_system_prompt(persona_obj: dict, profile_obj: dict, rag_context: str | None) -> str:
+
+# ====== System prompt ======
+
+def build_system_prompt(persona_obj: dict, profile_obj: dict, rag_context: Optional[str]) -> str:
     profile_text = profile_summary_text(profile_obj)
     context_block = f"\n\nRETRIEVAL CONTEXT (verbatim quotes; cite with [1], [2], ...):\n{rag_context}\n" if rag_context else ""
     return f"""
@@ -149,14 +178,18 @@ GENERAL BEHAVIOR:
 - If the answer is not in the context, say you don't know or explain how to find it.
 """.strip()
 
-# ========= Persistence (disk) =========
+
+# ====== Persistence (disk) ======
+
 def chat_path(chat_id: str) -> Path:
     return CHATS_DIR / f"{chat_id}.json"
+
 
 def store_dir(chat_id: str) -> Path:
     d = STORES_DIR / chat_id
     d.mkdir(exist_ok=True)
     return d
+
 
 def list_chats() -> List[dict]:
     if DEMO_MODE:
@@ -179,27 +212,29 @@ def list_chats() -> List[dict]:
     chats.sort(key=lambda c: c.get("updated_at", ""), reverse=True)
     return chats
 
+
 def load_chat(chat_id: str) -> dict:
     if DEMO_MODE:
-        # keep active chat solely in session
         return st.session_state.get("ACTIVE_CHAT", None)
     with open(chat_path(chat_id), "r", encoding="utf-8") as f:
         return json.load(f)
+
 
 def save_chat(chat: dict):
     if DEMO_MODE:
         st.session_state.ACTIVE_CHAT = chat
         return
-    chat["updated_at"] = datetime.utcnow().isoformat()
+    chat["updated_at"] = datetime.now(timezone.utc).isoformat()
     with open(chat_path(chat["id"]), "w", encoding="utf-8") as f:
         json.dump(chat, f, ensure_ascii=False, indent=2)
 
-def new_chat(persona_key: str, model: str, title: str | None = None) -> dict:
+
+def new_chat(persona_key: str, model: str, title: Optional[str] = None) -> dict:
     chat_id = uuid.uuid4().hex[:12]
     persona_name = PERSONAS.get(persona_key, {}).get("name", persona_key)
     if not title:
         title = f"{persona_name} — {datetime.now().strftime('%b %d, %H:%M')}"
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     chat = {
         "id": chat_id,
         "title": title,
@@ -212,6 +247,7 @@ def new_chat(persona_key: str, model: str, title: str | None = None) -> dict:
     save_chat(chat)
     return chat
 
+
 def delete_chat(chat_id: str):
     if DEMO_MODE:
         st.session_state.ACTIVE_CHAT = None
@@ -223,6 +259,14 @@ def delete_chat(chat_id: str):
     sd = STORES_DIR / chat_id
     if sd.exists():
         shutil.rmtree(sd, ignore_errors=True)
+
+
+def clear_store(chat_id: str):
+    sd = STORES_DIR / chat_id
+    if sd.exists():
+        shutil_rmtree = shutil.rmtree
+        shutil_rmtree(sd, ignore_errors=True)
+
 
 def to_markdown(chat: dict, persona_prompt: str) -> str:
     lines = [
@@ -237,7 +281,9 @@ def to_markdown(chat: dict, persona_prompt: str) -> str:
         lines += [f"**{role}:**", "", m["content"], ""]
     return "\n".join(lines)
 
-# ========= Auto-title =========
+
+# ====== Title helper ======
+
 def generate_chat_title(model: str, persona_name: str, user_text: str, assistant_text: str) -> str:
     fallback = (user_text or "New chat").strip()
     fallback = " ".join(fallback.split()[:6])
@@ -266,13 +312,19 @@ Return only the title text."""
             ],
             temperature=0.2,
         )
-        title = resp.choices[0].message.content.strip()
-        title = title.strip('"\''" ”“").rstrip(".!?")
+        # Groq SDK returns .message.content
+        content = resp.choices[0].message.content if hasattr(resp.choices[0].message, "content") else resp.choices[0].message["content"]
+        # Safely strip common quote marks and trailing punctuation
+        raw = str(content).strip()
+        bad_quotes = '"\'“”‘’'
+        title = raw.strip(bad_quotes).rstrip(".?!")
         return title or fallback
     except Exception:
         return fallback
 
-# ========= Streaming helper =========
+
+# ====== Chat completion (streaming-safe) ======
+
 def get_reply_streaming_safe(model: str, messages: list, temperature: float, placeholder):
     full = ""
     try:
@@ -284,6 +336,7 @@ def get_reply_streaming_safe(model: str, messages: list, temperature: float, pla
         ):
             token = None
             try:
+                # Groq streaming delta
                 token = chunk.choices[0].delta.content
             except Exception:
                 token = None
@@ -297,12 +350,21 @@ def get_reply_streaming_safe(model: str, messages: list, temperature: float, pla
             messages=messages,
             temperature=temperature,
         )
-        return resp.choices[0].message.content
+        content = resp.choices[0].message.content if hasattr(resp.choices[0].message, "content") else resp.choices[0].message["content"]
+        return str(content)
 
-# ========= Embedding / chunking =========
+
+# ====== Embedding / chunking ======
+
 @st.cache_resource(show_spinner=False)
-def load_embedder():
-    return SentenceTransformer(EMBED_MODEL_NAME)
+def _embedder_and_dim():
+    emb = SentenceTransformer(EMBED_MODEL_NAME)
+    if hasattr(emb, "get_sentence_embedding_dimension"):
+        dim = emb.get_sentence_embedding_dimension()
+    else:
+        dim = emb.encode(["probe"], normalize_embeddings=True).shape[1]
+    return emb, dim
+
 
 def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str]:
     text = " ".join(text.split())
@@ -319,24 +381,33 @@ def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str
             break
     return chunks
 
-# ========= File extractors =========
-def extract_text_from_pdf_filelike(file) -> List[Tuple[str, int]]:
-    # for DEMO_MODE in-memory uploads
-    out = []
-    reader = PdfReader(file)
-    for i, page in enumerate(reader.pages):
-        try:
-            txt = page.extract_text() or ""
-        except Exception:
-            txt = ""
-        if txt.strip():
-            out.append((txt, i + 1))
-    return out
 
-def extract_text_from_pdf_path(path: Path) -> List[Tuple[str, int]]:
-    out = []
-    with open(path, "rb") as f:
-        reader = PdfReader(f)
+# ====== File extractors ======
+
+def extract_text_from_pdf_filelike(file) -> List[Tuple[str, int]]:
+    """Read a Streamlit UploadedFile safely (pointer reset + BytesIO)."""
+    out: List[Tuple[str, int]] = []
+    try:
+        try:
+            file.seek(0)
+        except Exception:
+            pass
+        data = file.read()
+        if not data:
+            try:
+                data = file.getvalue()  # type: ignore[attr-defined]
+            except Exception:
+                data = b""
+        if not data:
+            return out
+
+        reader = PdfReader(BytesIO(data))
+        if getattr(reader, "is_encrypted", False):
+            try:
+                reader.decrypt("")
+            except Exception:
+                return out
+
         for i, page in enumerate(reader.pages):
             try:
                 txt = page.extract_text() or ""
@@ -344,59 +415,109 @@ def extract_text_from_pdf_path(path: Path) -> List[Tuple[str, int]]:
                 txt = ""
             if txt.strip():
                 out.append((txt, i + 1))
+    except Exception:
+        return out
     return out
+
+
+def extract_text_from_pdf_path(path: Path) -> List[Tuple[str, int]]:
+    out: List[Tuple[str, int]] = []
+    try:
+        with open(path, "rb") as f:
+            reader = PdfReader(f)
+            if getattr(reader, "is_encrypted", False):
+                try:
+                    reader.decrypt("")
+                except Exception:
+                    return out
+            for i, page in enumerate(reader.pages):
+                try:
+                    txt = page.extract_text() or ""
+                except Exception:
+                    txt = ""
+                if txt.strip():
+                    out.append((txt, i + 1))
+    except Exception:
+        return out
+    return out
+
 
 def extract_text_from_txt_path(path: Path) -> List[Tuple[str, int]]:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         txt = f.read()
     return [(txt, 1)]
 
-# ========= RAG (DEMO_MODE: in-memory) =========
+
+# ====== RAG (DEMO_MODE: in-memory) ======
+
 def _ensure_demo_rag():
     if "rag_index" not in st.session_state:
         st.session_state.rag_index = None
     if "rag_meta" not in st.session_state:
         st.session_state.rag_meta = {"docs": []}
 
+
 def demo_store_exists() -> bool:
     _ensure_demo_rag()
     return st.session_state.rag_index is not None and len(st.session_state.rag_meta["docs"]) > 0
 
+
 def demo_list_store_sources() -> list:
     _ensure_demo_rag()
     return [d["source"] for d in st.session_state.rag_meta["docs"]]
+
 
 def demo_clear_store():
     _ensure_demo_rag()
     st.session_state.rag_index = None
     st.session_state.rag_meta = {"docs": []}
 
+
 def demo_build_store(uploaded_files):
     _ensure_demo_rag()
-    embedder = load_embedder()
-    added = []
-    dim = 384
 
-    if st.session_state.rag_index is None:
-        st.session_state.rag_index = faiss.IndexFlatIP(dim)
+    if not FAISS_OK:
+        st.warning("FAISS not available in this runtime. RAG disabled.")
+        return {"added": [], "total_docs": len(st.session_state.rag_meta["docs"])}
+
+    # Load embedder + dim
+    try:
+        embedder, dim = _embedder_and_dim()
+    except Exception as e:
+        st.error(f"Failed to load embedder: {e}")
+        return {"added": [], "total_docs": len(st.session_state.rag_meta["docs"])}
+
+    # Create or reset FAISS index with correct dimensionality
+    try:
+        if st.session_state.rag_index is None:
+            st.session_state.rag_index = faiss.IndexFlatIP(dim)
+        elif st.session_state.rag_index.d != dim:
+            st.session_state.rag_index = faiss.IndexFlatIP(dim)
+            st.session_state.rag_meta = {"docs": []}
+    except Exception as e:
+        st.error(f"FAISS init failed (RAG disabled): {e}")
+        return {"added": [], "total_docs": len(st.session_state.rag_meta["docs"])}
+
+    added = []
 
     for file in uploaded_files:
         try:
             name = file.name
             ext = name.lower().rsplit(".", 1)[-1]
+
             if ext not in ("pdf", "txt"):
                 st.warning(f"Skipping unsupported file: {name}")
                 continue
 
-            # Extract
+            # --- Extract text ---
             if ext == "pdf":
-                try:
-                    pages = extract_text_from_pdf_filelike(file)
-                except Exception as e:
-                    st.error(f"Failed to read PDF {name}: {e}")
-                    continue
+                pages = extract_text_from_pdf_filelike(file)
             else:
                 try:
+                    try:
+                        file.seek(0)
+                    except Exception:
+                        pass
                     txt = file.read().decode("utf-8", errors="ignore")
                 except Exception as e:
                     st.error(f"Failed to read TXT {name}: {e}")
@@ -407,31 +528,47 @@ def demo_build_store(uploaded_files):
                 st.warning(f"No text found in {name}. Skipping.")
                 continue
 
-            # Chunk, embed, add
+            # --- Chunk, embed, add ---
             chunks_all = []
             for page_text, page_num in pages:
                 for ch in chunk_text(page_text):
-                    chunks_all.append({"text": ch, "page": page_num})
+                    if ch.strip():
+                        chunks_all.append({"text": ch, "page": page_num})
             if not chunks_all:
                 st.warning(f"No chunks produced for {name}. Skipping.")
                 continue
 
-            vecs = embedder.encode([c["text"] for c in chunks_all], batch_size=64, normalize_embeddings=True)
-            st.session_state.rag_index.add(np.array(vecs, dtype="float32"))
+            vecs = embedder.encode(
+                [c["text"] for c in chunks_all],
+                batch_size=64,
+                normalize_embeddings=True,
+            )
+            vecs = np.asarray(vecs, dtype="float32")
 
+            if vecs.shape[1] != st.session_state.rag_index.d:
+                st.warning(
+                    f"Dim mismatch (vecs {vecs.shape[1]} vs index {st.session_state.rag_index.d}). Recreating index."
+                )
+                st.session_state.rag_index = faiss.IndexFlatIP(vecs.shape[1])
+                st.session_state.rag_meta = {"docs": []}
+
+            st.session_state.rag_index.add(vecs)
             st.session_state.rag_meta["docs"].append({"source": name, "chunks": chunks_all})
             added.append({"file": name, "chunks": len(chunks_all)})
+
         except Exception as e:
-            st.error(f"Error processing {file.name}: {e}")
-            continue
+            st.error(f"Error processing {getattr(file, 'name', 'file')}: {e}")
 
     return {"added": added, "total_docs": len(st.session_state.rag_meta["docs"])}
 
 
 def demo_retrieve_context(query: str, k: int = 5):
     _ensure_demo_rag()
-    if st.session_state.rag_index is None:
+    # No index or no docs
+    if st.session_state.rag_index is None or not st.session_state.rag_meta["docs"]:
         return "", []
+
+    # Flatten
     flat = []
     for d in st.session_state.rag_meta["docs"]:
         src = d["source"]
@@ -440,9 +577,9 @@ def demo_retrieve_context(query: str, k: int = 5):
     if not flat:
         return "", []
 
-    embedder = load_embedder()
-    q = embedder.encode([query], normalize_embeddings=True).astype("float32")
-    scores, idxs = st.session_state.rag_index.search(q, min(k, len(flat)))
+    embedder, _ = _embedder_and_dim()
+    q_vec = embedder.encode([query], normalize_embeddings=True).astype("float32")
+    scores, idxs = st.session_state.rag_index.search(q_vec, min(k, len(flat)))
     idxs = idxs[0].tolist()
 
     citations, lines = [], []
@@ -453,58 +590,75 @@ def demo_retrieve_context(query: str, k: int = 5):
         lines.append(f"[{i}] (source: {item['source']} p.{item['page']}): {snippet}")
     return "\n".join(lines), citations
 
-# ========= RAG (disk) =========
+
+# ====== RAG (disk) ======
+
 def build_store_for_chat(chat_id: str, uploaded_files) -> Dict:
     if DEMO_MODE:
         st.warning("RAG storage disabled in demo mode — using in-memory only.")
+        return {"added": [], "total_docs": 0}
+    if not FAISS_OK:
+        st.warning("FAISS not available in this runtime. RAG disabled.")
         return {"added": [], "total_docs": 0}
 
     sd = store_dir(chat_id)
     index_path = sd / "index.faiss"
     meta_path = sd / "meta.json"
 
-    dim = 384
+    try:
+        embedder, dim = _embedder_and_dim()
+    except Exception as e:
+        st.error(f"Failed to load embedder: {e}")
+        return {"added": [], "total_docs": 0}
+
     if index_path.exists():
         index = faiss.read_index(str(index_path))
         with open(meta_path, "r", encoding="utf-8") as f:
             meta = json.load(f)
+        if index.d != dim:
+            index = faiss.IndexFlatIP(dim)
+            meta = {"docs": []}
     else:
         index = faiss.IndexFlatIP(dim)
         meta = {"docs": []}
 
-    embedder = load_embedder()
     added = []
 
     for file in uploaded_files:
-        fname = file.name
-        ext = fname.lower().rsplit(".", 1)[-1]
-        tmp_path = sd / f"_tmp_{uuid.uuid4().hex}.{ext}"
-        with open(tmp_path, "wb") as f:
-            f.write(file.getbuffer())
+        try:
+            fname = file.name
+            ext = fname.lower().rsplit(".", 1)[-1]
+            tmp_path = sd / f"_tmp_{uuid.uuid4().hex}.{ext}"
+            with open(tmp_path, "wb") as f:
+                f.write(file.getbuffer())
 
-        if ext == "pdf":
-            pages = extract_text_from_pdf_path(tmp_path)
-        elif ext == "txt":
-            pages = extract_text_from_txt_path(tmp_path)
-        else:
+            if ext == "pdf":
+                pages = extract_text_from_pdf_path(tmp_path)
+            elif ext == "txt":
+                pages = extract_text_from_txt_path(tmp_path)
+            else:
+                tmp_path.unlink(missing_ok=True)
+                continue
+
+            chunks_all = []
+            for page_text, page_num in pages:
+                for ch in chunk_text(page_text):
+                    if ch.strip():
+                        chunks_all.append({"text": ch, "page": page_num})
+            if not chunks_all:
+                tmp_path.unlink(missing_ok=True)
+                continue
+
+            vecs = embedder.encode([c["text"] for c in chunks_all], batch_size=64, normalize_embeddings=True)
+            vecs = np.asarray(vecs, dtype="float32")
+            index.add(vecs)
+
+            meta["docs"].append({"source": fname, "chunks": chunks_all})
+            added.append({"file": fname, "chunks": len(chunks_all)})
+
             tmp_path.unlink(missing_ok=True)
-            continue
-
-        chunks_all = []
-        for page_text, page_num in pages:
-            for ch in chunk_text(page_text):
-                chunks_all.append({"text": ch, "page": page_num})
-        if not chunks_all:
-            tmp_path.unlink(missing_ok=True)
-            continue
-
-        vecs = embedder.encode([c["text"] for c in chunks_all], batch_size=64, normalize_embeddings=True)
-        index.add(np.array(vecs, dtype="float32"))
-
-        meta["docs"].append({"source": fname, "chunks": chunks_all})
-        added.append({"file": fname, "chunks": len(chunks_all)})
-
-        tmp_path.unlink(missing_ok=True)
+        except Exception as e:
+            st.error(f"Error processing {fname}: {e}")
 
     faiss.write_index(index, str(index_path))
     with open(meta_path, "w", encoding="utf-8") as f:
@@ -512,11 +666,13 @@ def build_store_for_chat(chat_id: str, uploaded_files) -> Dict:
 
     return {"added": added, "total_docs": len(meta["docs"])}
 
+
 def store_exists(chat_id: str) -> bool:
     if DEMO_MODE:
         return False
     sd = STORES_DIR / chat_id
     return (sd / "index.faiss").exists() and (sd / "meta.json").exists()
+
 
 def list_store_sources(chat_id: str) -> List[str]:
     if DEMO_MODE:
@@ -529,8 +685,9 @@ def list_store_sources(chat_id: str) -> List[str]:
         meta = json.load(f)
     return [d["source"] for d in meta.get("docs", [])]
 
+
 def retrieve_context(chat_id: str, query: str, k: int = 5) -> Tuple[str, List[Dict]]:
-    if DEMO_MODE:
+    if DEMO_MODE or not FAISS_OK:
         return "", []
     sd = STORES_DIR / chat_id
     index_path = sd / "index.faiss"
@@ -550,7 +707,7 @@ def retrieve_context(chat_id: str, query: str, k: int = 5) -> Tuple[str, List[Di
     if not flat:
         return "", []
 
-    embedder = load_embedder()
+    embedder, _ = _embedder_and_dim()
     q_vec = embedder.encode([query], normalize_embeddings=True)
     q_vec = np.array(q_vec, dtype="float32")
     scores, idxs = index.search(q_vec, min(k, len(flat)))
@@ -566,13 +723,15 @@ def retrieve_context(chat_id: str, query: str, k: int = 5) -> Tuple[str, List[Di
 
     return "\n".join(lines), citations
 
-# ========= Session bootstrap =========
+
+# ====== Session bootstrap ======
 if "current_chat_id" not in st.session_state:
     st.session_state.current_chat_id = None
 if "cached_chat" not in st.session_state:
     st.session_state.cached_chat = None
 
-# ========= Sidebar =========
+
+# ====== Sidebar ======
 with st.sidebar:
     st.subheader("🗂️ Chats")
     default_persona_key = st.selectbox(
@@ -649,6 +808,14 @@ with st.sidebar:
     else:
         st.caption("No persisted chats here." if DEMO_MODE else "No chats yet. Click **New Chat** to start.")
 
+    # Quick utility
+    if st.session_state.get("cached_chat"):
+        if st.button("🧼 Clear Chat Messages"):
+            st.session_state.cached_chat["messages"] = []
+            save_chat(st.session_state.cached_chat)
+            st.success("Cleared chat.")
+            st.rerun()
+
     # Profile editor
     st.markdown("---")
     st.subheader("👤 Profile (personalizes replies)")
@@ -690,33 +857,39 @@ with st.sidebar:
 
     files = st.file_uploader("Add PDFs or .txt files", type=["pdf", "txt"], accept_multiple_files=True)
     if st.button("➕ Add to Knowledge") and files:
-        with st.spinner("Indexing…"):
-            if DEMO_MODE:
-                summary = demo_build_store(files)
-            else:
-                if st.session_state.current_chat_id:
-                    summary = build_store_for_chat(st.session_state.current_chat_id, files)
+        try:
+            with st.spinner("Indexing…"):
+                if DEMO_MODE:
+                    summary = demo_build_store(files)
                 else:
-                    st.warning("Create or open a chat first.")
-                    summary = {"added": [], "total_docs": 0}
-        st.success(f"Added {len(summary['added'])} file(s). Total docs: {summary['total_docs']}.")
-        st.rerun()
+                    if st.session_state.current_chat_id:
+                        summary = build_store_for_chat(st.session_state.current_chat_id, files)
+                    else:
+                        st.warning("Create or open a chat first.")
+                        summary = {"added": [], "total_docs": 0}
+            st.success(f"Added {len(summary['added'])} file(s). Total docs: {summary['total_docs']}.")
+            st.rerun()
+        except Exception as e:
+            st.exception(e)  # show full traceback in the app
 
     if st.button("🧹 Clear Knowledge"):
-        if DEMO_MODE:
-            demo_clear_store()
-        else:
-            if st.session_state.current_chat_id:
-                clear_store(st.session_state.current_chat_id)
-        st.success("Cleared knowledge store.")
-        st.rerun()
+        try:
+            if DEMO_MODE:
+                demo_clear_store()
+            else:
+                if st.session_state.current_chat_id:
+                    clear_store(st.session_state.current_chat_id)
+            st.success("Cleared knowledge store.")
+            st.rerun()
+        except Exception as e:
+            st.exception(e)
 
-# ========= Load active chat (init) =========
+
+# ====== Load active chat (init) ======
 if st.session_state.current_chat_id and not st.session_state.cached_chat:
     st.session_state.cached_chat = load_chat(st.session_state.current_chat_id)
 
 if not st.session_state.current_chat_id:
-    # In demo mode we still keep one active in session so UI isn't empty
     default = new_chat(list(PERSONAS.keys())[0], MODEL_CHOICES[0], title="Welcome Chat")
     st.session_state.current_chat_id = default["id"]
     st.session_state.cached_chat = default
@@ -726,7 +899,8 @@ persona_key = active_chat["persona_key"]
 model = active_chat["model"]
 persona = PERSONAS[persona_key]
 
-# ========= Main area =========
+
+# ====== Main area ======
 st.title("🤖 Groq Persona Chatbot")
 if DEMO_MODE:
     st.caption("**Demo Mode** is ON — no data is written to disk; uploads & chats live only in memory per session.")
@@ -743,7 +917,7 @@ with st.expander("Try example prompts"):
         st.code(ex)
 
 # Input
-user_text = st.chat_input("Type your message...")
+user_text = st.chat_input("Type your message…")
 
 if user_text:
     active_chat["messages"].append({"role": "user", "content": user_text})
